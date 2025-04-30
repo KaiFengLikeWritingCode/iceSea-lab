@@ -3,67 +3,68 @@ import numpy as np
 import cv2
 from pathlib import Path
 
-# 1. 读取数据
-nc_path = Path("glo_3ice.nc")
-ds = xr.open_dataset(nc_path, chunks={"time": 64})
-ssha    = ds["zos_cglo"]       # (time, lat, lon)
-sithick = ds["sithick_cglo"]   # (time, lat, lon)
-times   = ds["time"].values    # datetime64[ns] array
+# ---------- 读取 ----------
+ds        = xr.open_dataset("glo_3ice.nc")
+ssha      = ds["zos_cglo"]
+sithick   = ds["sithick_cglo"]
+times     = ds["time"].values
 
-# 2. 输出目录：训练 / 测试，各自的灰度图和标签
-train_ssha = Path("train_ssha_png"); train_ssha.mkdir(exist_ok=True)
-train_mask = Path("train_mask_png"); train_mask.mkdir(exist_ok=True)
-test_ssha  = Path("test_ssha_png");  test_ssha.mkdir(exist_ok=True)
-test_mask  = Path("test_mask_png");  test_mask.mkdir(exist_ok=True)
+train_ssha = Path("data/train_ssha_png"); train_ssha.mkdir(exist_ok=True)
+train_mask = Path("data/train_mask_png"); train_mask.mkdir(exist_ok=True)
+test_ssha  = Path("data/test_ssha_png");  test_ssha.mkdir(exist_ok=True)
+test_mask  = Path("data/test_mask_png");  test_mask.mkdir(exist_ok=True)
 
-# 3. 判断“最后一年”起始时间
-#    取最后一个时间点所属的年度（如 2010-01-01 → 2010），减 1 年即 2009-01-01
 last_year_start = times[-1].astype("datetime64[Y]") - np.timedelta64(1, "Y")
 
-# 4. 对称性判别函数
-def is_symmetric(arr, thr=0.05):
-    vmax, vmin = np.nanmax(arr), np.nanmin(arr)
+# ---------- 辅助 ----------
+def is_symmetric(a, thr=0.05):
+    vmax, vmin = np.nanmax(a), np.nanmin(a)
     return abs(vmax + vmin) / max(abs(vmax), abs(vmin)) < thr
 
-# 5. 批量生成并按时间划分
-for t, tval in enumerate(times):
-    # 根据时间决定是训练集还是测试集
-    if tval >= last_year_start:
-        ssha_dir = test_ssha
-        mask_dir = test_mask
-    else:
-        ssha_dir = train_ssha
-        mask_dir = train_mask
+H = W = 512
+palette = np.array([[  0,   0,   0],    # 0 sea   black
+                    [  0, 150, 255],    # 1 ice   bright blue
+                    [255,   0,   0]],   # 2 land  red
+                   np.uint8)
 
-    # 5.1 生成 SSHA 灰度图
-    arr = ssha.isel(time=t).values           # (lat, lon)
-    if is_symmetric(arr):
-        vm   = np.nanmax(np.abs(arr))
-        norm = (arr + vm) / (2 * vm)
+# ---------- 主循环 ----------
+for idx, tval in enumerate(times):
+    date = np.datetime_as_string(tval, unit="D")
+    ssha_slice = ssha.isel(time=idx).values
+    ice_slice  = sithick.isel(time=idx).values
+
+    ssha_dir, mask_dir = (test_ssha, test_mask) if tval >= last_year_start else (train_ssha, train_mask)
+
+    # ---------- SSHA 灰度 ----------
+    if is_symmetric(ssha_slice):
+        vm   = np.nanmax(np.abs(ssha_slice))
+        norm = (ssha_slice + vm) / (2*vm)
     else:
-        anomaly = arr - np.nanmean(arr)
+        anomaly = ssha_slice - np.nanmean(ssha_slice)
         vm      = np.nanmax(np.abs(anomaly))
-        norm    = (anomaly + vm) / (2 * vm)
-    norm = np.nan_to_num(norm, nan=0.0)
-    gray = np.uint8(np.clip(norm * 255, 0, 255))
+        norm    = (anomaly + vm) / (2*vm)
+    gray = np.uint8(np.clip(np.nan_to_num(norm)*255, 0, 255))
+    gray = cv2.resize(gray, (W, H), cv2.INTER_CUBIC)
+    cv2.imwrite(str(ssha_dir / f"ssha_{date}.png"), gray)
 
-    # 放大到 512²
-    if gray.shape[0] < 512 or gray.shape[1] < 512:
-        gray = cv2.resize(gray, (512,512), interpolation=cv2.INTER_CUBIC)
+    # ---------- 先判别，后统一放大 ----------
+    land_mask0 = np.isnan(ice_slice) | np.isnan(ssha_slice)
+    ice_mask0  = (ice_slice > 0) & (~land_mask0)          # 只要厚度>0 即冰
 
-    date_str = np.datetime_as_string(tval, unit="D")
-    cv2.imwrite(str(ssha_dir / f"ssha_{date_str}.png"), gray)
+    lbl0 = np.zeros_like(ssha_slice, dtype=np.uint8)
+    lbl0[land_mask0]         = 2
+    lbl0[ice_mask0]          = 1      # land 已经标过，海冰覆盖水面
 
-    # 5.2 生成三分类标签
-    land_mask = np.isnan(arr).astype(np.uint8)             # 1=陆地
-    ice_mask  = (sithick.isel(time=t).values > 0).astype(np.uint8)  # 1=海冰
+    # 最近邻一次性放大
+    lbl = cv2.resize(lbl0, (W, H), cv2.INTER_NEAREST)
 
-    # 放大到 512²
-    land_mask = cv2.resize(land_mask, (512,512), interpolation=cv2.INTER_NEAREST)
-    ice_mask  = cv2.resize(ice_mask,  (512,512), interpolation=cv2.INTER_NEAREST)
+    cv2.imwrite(str(mask_dir / f"lbl_{date}.png"), lbl)
 
-    label = np.zeros_like(land_mask, dtype=np.uint8)
-    label[land_mask == 1] = 2
-    label[(land_mask == 0) & (ice_mask == 1)] = 1
+    # one-hot
+    oh = np.zeros((3, H, W), np.uint8)
+    for c in (0,1,2):
+        oh[c] = (lbl == c).astype(np.uint8)
+    np.save(mask_dir / f"onehot_{date}.npy", oh)
 
-    cv2.imwrite(str(mask_dir / f"lbl_{date_str}.png"), label)
+    # 彩色调试
+    cv2.imwrite(str(mask_dir / f"mask_rgb_{date}.png"), palette[lbl])
