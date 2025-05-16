@@ -12,7 +12,7 @@ train:
   device: cuda
   num_workers: 4
   pin_memory: true
-  save_interval_steps: 1000
+  save_interval_steps: 10001
   save_interval_epochs: 5
   freeze_bn: true
 model:
